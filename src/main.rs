@@ -1,10 +1,11 @@
 // T
 // o
-// w v0.1.0 by Seldom 2020
+// w v0.2.0 by Seldom 2020
 // e
 // r
 
 use std::{
+    collections::VecDeque,
     fmt::{Display, Formatter, Result},
     io::{stdin, stdout, Write},
 };
@@ -96,7 +97,7 @@ impl Instruction {
                 }
                 (Self::Jump(char_pointer + 1), pointer + 1)
             },
-            'W' => {
+            '.' => {
                 let (expression, pointer) = Expression::parse(program, pointer + 1);
                 (Self::Write(expression), pointer)
             },
@@ -113,28 +114,29 @@ impl Instruction {
         }
     }
 
-    fn execute(self, mut state: State) -> (State, Option<usize>) {
+    fn execute(self, mut state: State, mut buffer: VecDeque<Option<char>>) -> (State, VecDeque<Option<char>>, Option<usize>) {
         let mut destination = None;
         match self {
-            Self::Assign(register, expression) => state.set_register(&register, expression.evaluate(&state)),
+            Self::Assign(register, expression) => state.set_register(&register, expression.evaluate(&state, &mut buffer)),
             Self::Jump(dest) => destination = Some(dest),
             Self::Write(expression) => {
-                if let Some(value) = expression.evaluate(&state) {
+                if let Some(value) = expression.evaluate(&state, &mut buffer) {
                     print!("{}", value);
                     stdout().flush().expect("Failed to flush stdout");
                 }
             },
             Self::Condition(expression, instruction) => {
-                let (new_state, new_destination) = match expression.evaluate(&state) {
-                    Some(Value::Boolean(true)) | Some(Value::Character(_)) | Some(Value::State(_)) => instruction.execute(state),
-                    Some(Value::Boolean(false)) | Some(Value::Integer(0)) | None => (state, destination),
-                    Some(Value::Integer(_)) => instruction.execute(state),
+                let (new_state, new_buffer, new_destination) = match expression.evaluate(&state, &mut buffer) {
+                    Some(Value::Boolean(true)) | Some(Value::Character(_)) | Some(Value::State(_)) => instruction.execute(state, buffer),
+                    Some(Value::Boolean(false)) | Some(Value::Integer(0)) | None => (state, buffer, destination),
+                    Some(Value::Integer(_)) => instruction.execute(state, buffer),
                 };
                 state = new_state;
+                buffer = new_buffer;
                 destination = new_destination;
             },
             Self::Extract(expression) => {
-                match expression.evaluate(&state) {
+                match expression.evaluate(&state, &mut buffer) {
                     Some(Value::State(extracted_state)) => {
                         for register in &[Register::A, Register::B, Register::C] {
                             if let Some(value) = extracted_state.get_register(register) {
@@ -146,13 +148,14 @@ impl Instruction {
                 }
             }
         }
-        (state, destination)
+        (state, buffer, destination)
     }
 }
 
 enum Expression {
     Literal(Value),
     Register(Register),
+    Negation(Box<Expression>),
     Sum(Box<Expression>, Box<Expression>),
     Difference(Box<Expression>, Box<Expression>),
     Product(Box<Expression>, Box<Expression>),
@@ -161,14 +164,16 @@ enum Expression {
     Equals(Box<Expression>, Box<Expression>),
     GreaterThan(Box<Expression>, Box<Expression>),
     LessThan(Box<Expression>, Box<Expression>),
-    Read,
-    ReadString(Register, Register),
+    ReadCharacter,
+    ReadInteger,
     Archive(Vec<Register>),
 }
 
 impl Expression {
     fn parse(program: &Vec<char>, mut pointer: usize) -> (Self, usize) {
         match program[pointer] {
+            'T' => (Self::Literal(Value::Boolean(true)), pointer + 1),
+            'F' => (Self::Literal(Value::Boolean(false)), pointer + 1),
             '0'..='9' => {
                 let start = pointer;
                 let end = loop {
@@ -179,30 +184,21 @@ impl Expression {
                 };
                 (Self::Literal(Value::Integer(program[start..end].iter().map(|c| c.to_digit(10).unwrap()).sum::<u32>() as i32)), end)
             },
+            '"' => (Self::Literal(Value::Character(None)), pointer + 1),
             '\'' => {
                 match program[pointer + 1] {
                     '\\' => match program[pointer + 2] {
-                        'n' => (Self::Literal(Value::Character('\n')), pointer + 3),
+                        'n' => (Self::Literal(Value::Character(Some('\n'))), pointer + 3),
                         x => panic!(format!("Unexpected escape sequence at {}: {}", pointer, x))
                     },
-                    x => (Self::Literal(Value::Character(x)), pointer + 2),
+                    x => (Self::Literal(Value::Character(Some(x))), pointer + 2),
                 }
             },
-            '"' => {
-                let beginning = pointer;
-                let end = loop {
-                    pointer += 1;
-                    if program[pointer] == '\\' {
-                        pointer += 1;
-                    } else if program[pointer] == '"' {
-                        break pointer;
-                    }
-                };
-                let stack_register = Register::from_char(program[end + 1]);
-                let value_register = Register::from_char(program[end + 2]);
-                (Expression::Literal(Value::from_string(program, beginning + 1, end, &stack_register, &value_register)), end + 3)
-            },
             'a' | 'b' | 'c' => (Self::Register(Register::from_char(program[pointer])), pointer + 1),
+            '!' => {
+                let (expression, pointer) = Self::parse(program, pointer + 1);
+                (Self::Negation(Box::new(expression)), pointer)
+            }
             '+' => {
                 let (expression_1, pointer) = Self::parse(program, pointer + 1);
                 let (expression_2, pointer) = Self::parse(program, pointer);
@@ -243,8 +239,8 @@ impl Expression {
                 let (expression_2, pointer) = Self::parse(program, pointer);
                 (Self::LessThan(Box::new(expression_1), Box::new(expression_2)), pointer)
             },
-            'R' => (Self::Read, pointer + 1),
-            'S' => (Self::ReadString(Register::from_char(program[pointer + 1]), Register::from_char(program[pointer + 2])), pointer + 3),
+            ',' => (Self::ReadCharacter, pointer + 1),
+            ';' => (Self::ReadInteger, pointer + 1),
             '[' => {
                 let mut registers = Vec::new();
                 loop {
@@ -260,51 +256,58 @@ impl Expression {
         }
     }
 
-    fn evaluate(self, state: &State) -> Option<Value> {
+    fn evaluate(self, state: &State, buffer: &mut VecDeque<Option<char>>) -> Option<Value> {
         match self {
             Self::Literal(value) => Some(value),
             Self::Register(register) => state.get_register(&register),
+            Self::Negation(expression) => {
+                match expression.evaluate(state, buffer) {
+                    Some(Value::Boolean(boolean)) =>
+                        Some(Value::Boolean(!boolean)),
+                    _ => None,
+                }
+            },
             Self::Sum(expression_1, expression_2) => {
-                match (expression_1.evaluate(state), expression_2.evaluate(state)) {
+                match (expression_1.evaluate(state, buffer), expression_2.evaluate(state, buffer)) {
                     (Some(Value::Integer(integer_1)), Some(Value::Integer(integer_2))) =>
                         Some(Value::Integer(integer_1 + integer_2)),
-                    (Some(Value::Character(character)), Some(Value::Integer(integer))) =>
-                        Some(Value::Character((character as i32 + integer) as u8 as char)),
+                    (Some(Value::Character(Some(character))), Some(Value::Integer(integer))) =>
+                        Some(Value::Character(Some((character as i32 + integer) as u8 as char))),
                     _ => None,
                 }
             },
             Self::Difference(expression_1, expression_2) => {
-                match (expression_1.evaluate(state), expression_2.evaluate(state)) {
+                match (expression_1.evaluate(state, buffer), expression_2.evaluate(state, buffer)) {
                     (Some(Value::Integer(integer_1)), Some(Value::Integer(integer_2))) =>
                         Some(Value::Integer(integer_1 - integer_2)),
-                    (Some(Value::Character(character)), Some(Value::Integer(integer))) =>
-                        Some(Value::Character((character as i32 - integer) as u8 as char)),
+                    (Some(Value::Character(Some(character))), Some(Value::Integer(integer))) =>
+                        Some(Value::Character(Some((character as i32 - integer) as u8 as char))),
                     _ => None,
                 }
             },
             Self::Product(expression_1, expression_2) => {
-                match (expression_1.evaluate(state), expression_2.evaluate(state)) {
+                match (expression_1.evaluate(state, buffer), expression_2.evaluate(state, buffer)) {
                     (Some(Value::Integer(integer_1)), Some(Value::Integer(integer_2))) =>
                         Some(Value::Integer(integer_1 * integer_2)),
                     _ => None,
                 }
             },
             Self::Quotient(expression_1, expression_2) => {
-                match (expression_1.evaluate(state), expression_2.evaluate(state)) {
+                match (expression_1.evaluate(state, buffer), expression_2.evaluate(state, buffer)) {
                     (Some(Value::Integer(integer_1)), Some(Value::Integer(integer_2))) =>
                         Some(Value::Integer(integer_1 / integer_2)),
                     _ => None,
                 }
             },
             Self::Modulus(expression_1, expression_2) => {
-                match (expression_1.evaluate(state), expression_2.evaluate(state)) {
+                match (expression_1.evaluate(state, buffer), expression_2.evaluate(state, buffer)) {
                     (Some(Value::Integer(integer_1)), Some(Value::Integer(integer_2))) =>
                         Some(Value::Integer(integer_1 % integer_2)),
                     _ => None,
                 }
             },
             Self::Equals(expression_1, expression_2) => {
-                match (expression_1.evaluate(state), expression_2.evaluate(state)) {
+                match (expression_1.evaluate(state, buffer), expression_2.evaluate(state, buffer)) {
                     (Some(Value::Boolean(boolean_1)), Some(Value::Boolean(boolean_2))) =>
                         Some(Value::Boolean(boolean_1 == boolean_2)),
                     (Some(Value::Integer(integer_1)), Some(Value::Integer(integer_2))) =>
@@ -315,7 +318,7 @@ impl Expression {
                 }
             },
             Self::GreaterThan(expression_1, expression_2) => {
-                match (expression_1.evaluate(state), expression_2.evaluate(state)) {
+                match (expression_1.evaluate(state, buffer), expression_2.evaluate(state, buffer)) {
                     (Some(Value::Integer(integer_1)), Some(Value::Integer(integer_2))) =>
                         Some(Value::Boolean(integer_1 > integer_2)),
                     (Some(Value::Character(character_1)), Some(Value::Character(character_2))) =>
@@ -324,7 +327,7 @@ impl Expression {
                 }
             },
             Self::LessThan(expression_1, expression_2) => {
-                match (expression_1.evaluate(state), expression_2.evaluate(state)) {
+                match (expression_1.evaluate(state, buffer), expression_2.evaluate(state, buffer)) {
                     (Some(Value::Integer(integer_1)), Some(Value::Integer(integer_2))) =>
                         Some(Value::Boolean(integer_1 < integer_2)),
                     (Some(Value::Character(character_1)), Some(Value::Character(character_2))) =>
@@ -332,12 +335,23 @@ impl Expression {
                     _ => None,
                 }
             },
-            Self::Read => {
-                Some(Value::Integer(get_input().trim().parse().unwrap()))
+            Self::ReadCharacter => {
+                Some(Value::Character(match buffer.pop_back() {
+                    Some(character) => character,
+                    None => {
+                        for character in get_input().chars() {
+                            buffer.push_front(Some(character));
+                        }
+                        buffer.push_front(None);
+                        buffer.pop_back().unwrap()
+                    }
+                }))
             },
-            Self::ReadString(stack_register, value_register) => {
-                let string = get_input();
-                Some(Value::from_string(&string.chars().collect(), 0, string.len() - 1, &stack_register, &value_register))
+            Self::ReadInteger => {
+                Some(match get_input().trim().parse() {
+                    Ok(integer) => Value::Integer(integer),
+                    Err(_) => Value::Character(None)
+                })
             },
             Self::Archive(registers) => {
                 let mut archive = State::default();
@@ -354,7 +368,7 @@ impl Expression {
 enum Value {
     Boolean(bool),
     Integer(i32),
-    Character(char),
+    Character(Option<char>),
     State(Box<State>),
 }
 
@@ -363,50 +377,9 @@ impl Value {
         match self {
             Self::Boolean(_) => "".to_string(),
             Self::Integer(integer) => integer.to_string(),
-            Self::Character(character) => character.to_string(),
-            Self::State(state) => {
-                let mut string_1 = String::new();
-                let mut string_2 = String::new();
-                for value in [&state.a, &state.b, &state.c].iter() {
-                    match value {
-                        Some(val) => {
-                            if let Self::State(_) = val {
-                                string_2 += &val.to_string();
-                            } else {
-                                string_1 += &val.to_string();
-                            }
-                        }
-                        None => (),
-                    }
-                }
-                string_1 + &string_2
-            }
-        }
-    }
-
-    fn from_string(string: &Vec<char>, beginning: usize, end: usize, stack_register: &Register, value_register: &Register) -> Self {
-        let mut pointer = end;
-        let mut value = Value::Boolean(false);
-        loop {
-            if pointer == beginning {
-                break value;
-            }
-            pointer -= 1;
-            let escaped = pointer > beginning && string[pointer - 1] == '\\';
-            let mut state = State::default();
-            state.set_register(stack_register, Some(value));
-            state.set_register(value_register, Some(Value::Character(if escaped {
-                let character = match string[pointer] {
-                    'n' => '\n',
-                    '"' => '"',
-                    _ => panic!(format!("Unexpected escape sequence in string: {}", string[pointer])),
-                };
-                pointer -= 1;
-                character
-            } else {
-                string[pointer]
-            })));
-            value = Value::State(Box::new(state));
+            Self::Character(Some(character)) => character.to_string(),
+            Self::Character(None) => "".to_string(),
+            Self::State(_) => "".to_string()
         }
     }
 }
@@ -419,46 +392,74 @@ impl Display for Value {
 
 // Examples:
 
-// From Exercises for Programmers by Brian P. Hogan
-
-// W"What is your name? "abaSabW"Hello, "abWaW", nice to meet you!\n"ab
-// W"What is the input string? "abaSacW"\""abb[a]c0?a[c+c1b[bc]XaXb?a]WbW"\" has "abWcW" characters.\n"ab
-// W"What is the input string? "ab
-// aSac
-// W"\""ab
-// b[a]
-// c0
-// ?a[
-//   c+c1
-//   b[bc]
-//   Xa
-//   Xb
-// ?a]
-// Wb
-// W"\" has "abWcW" characters.\n"ab
-// W"What is the quote? "abaSabW"Who said it? "abbSbaWbW" says, \""abWaW"\"\n"ab
-// W"Enter a noun: "abaSacW"Enter a verb: "abbSbcW"Enter an adjective: "abcScaa[ac]W"Enter an adverb: "abcScaW"Do you "abWbW" your "abbcXaWcW" "abWaW" "abWbW"? That's hilarious!\n"ab
-// W"What is the first number? "abaRW"What is the second number? "abbRWaW" + "abWbW" = "abW+abW'\nWaW" - "abWbW" = "abW-abW'\nWaW" * "abWbW" = "abW*abW'\nWaW" / "abWbW" = "abW/abW'\n
-
-// From Code Golf Stack Exchange:
-
 // Factorial:
-// aRb1?>a0[b*aba-a1?>a0]Wb
+// a;b1?>a0[b*aba-a1?>a0].b
 
-// Hello, World!:
-// W"Hello, World!"ab
+// Scream very loudly:
+// [.'A]
+
+// Hello interpreter:
+// [a,b=a'h?b[.'H.'e.'l.'l.'o.' .'W.'o.'r.'l.'d?F]?b]?!=a"[.'e.'r.'r?F]
+
+// Running second maximum:
+// b;cba,[a;?>ab[ba?>bc[bcca?F]?F].b?!=,"]
+
+// Pascal's Triangle Generator
+/*
+c.
+b4
+a[b]
+b3
+[
+    c-c1
+    a[abc]
+?c]
+[
+    Xa
+    ?=b3[
+        cb
+        [
+            c[bc]
+            b2
+            a[abc]
+            Xc
+            c-c1
+        ?c]
+    ]
+    ?=b2[
+        b1
+    ]
+    ?=b1[
+        Xc
+        ?|=c0=bc[
+            b0
+            c1
+        ]
+        !|=c0=bc[
+            b-b1
+            c[bc]
+            
+        ]
+    ]
+    ?b0[
+
+    ]
+?=b4]
+*/
 
 fn main() {
-    execute(r#"W"What is the input string? "abaSacW"\""abb[a]c0?a[c+c1b[bc]XaXb?a]WbW"\" has "abWcW" characters.\n"ab"#.chars().collect());
+    execute(r#"b;cba;[?>ab[ba?>bc[bcca?F]?F].ba;?!=a"]"#.chars().collect());
 }
 
 fn execute(program: Vec<char>) {
     let mut pointer = 0;
     let mut state = State::default();
+    let mut buffer = VecDeque::new();
     while pointer < program.len() {
         let (instruction, new_pointer) = Instruction::parse(&program, pointer);
-        let (new_state, dest) = instruction.execute(state);
+        let (new_state, new_buffer, dest) = instruction.execute(state, buffer);
         state = new_state;
+        buffer = new_buffer;
         if let Some(destination) = dest {
             pointer = destination;
         } else {
@@ -470,5 +471,5 @@ fn execute(program: Vec<char>) {
 fn get_input() -> String {
     let mut string = String::new();
     stdin().read_line(&mut string).expect("Failed to read line");
-    string
+    string.trim().to_string()
 }
